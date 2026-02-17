@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# ─────────────────────────────────────────────────────────────────────────────
-# REFORMMED Monitor — Linux Agent Installer
-# Works both ways:
-#   curl -sSL https://raw.githubusercontent.com/vivekdummi/com.agent.reformmed.monitor/main/install-linux.sh | sudo bash
-#   sudo bash install-linux.sh
-# ─────────────────────────────────────────────────────────────────────────────
 set -e
 
 RED='\033[0;31m'
@@ -30,19 +24,19 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# ── Use /dev/tty so prompts work with curl|bash ───────────────────────────────
+# KEY FIX: redirect stdin from /dev/tty so prompts work with curl|bash
 exec < /dev/tty
 
 echo -e "${BOLD}Enter the following details:${NC}"
 echo ""
 
-read -p "$(echo -e ${YELLOW}"VM Server IP (e.g. 164.52.221.241): "${NC})" VM_IP
-read -p "$(echo -e ${YELLOW}"VM Server port [8000]: "${NC})" VM_PORT
+read -p "VM Server IP (e.g. 164.52.221.241): " VM_IP
+read -p "VM Server port [8000]: " VM_PORT
 VM_PORT="${VM_PORT:-8000}"
-read -p "$(echo -e ${YELLOW}"API Secret Key: "${NC})" API_KEY
-read -p "$(echo -e ${YELLOW}"Machine name (e.g. Salem-Hospital-PC1): "${NC})" SYSTEM_NAME
-read -p "$(echo -e ${YELLOW}"Location (e.g. Salem): "${NC})" LOCATION
-read -p "$(echo -e ${YELLOW}"Send interval in seconds [1]: "${NC})" INTERVAL
+read -p "API Secret Key: " API_KEY
+read -p "Machine name (e.g. Salem-Hospital-PC1): " SYSTEM_NAME
+read -p "Location (e.g. Salem): " LOCATION
+read -p "Send interval in seconds [1]: " INTERVAL
 INTERVAL="${INTERVAL:-1}"
 
 echo ""
@@ -65,7 +59,7 @@ echo -e "${BLUE}[2/5]${NC} Creating install directory..."
 mkdir -p "${INSTALL_DIR}"
 
 echo -e "${BLUE}[3/5]${NC} Downloading agent..."
-curl -sSL "${REPO_RAW}/agent.py"        -o "${INSTALL_DIR}/agent.py"
+curl -sSL "${REPO_RAW}/agent.py"         -o "${INSTALL_DIR}/agent.py"
 curl -sSL "${REPO_RAW}/requirements.txt" -o "${INSTALL_DIR}/requirements.txt"
 
 echo -e "${BLUE}[4/5]${NC} Installing Python dependencies..."
