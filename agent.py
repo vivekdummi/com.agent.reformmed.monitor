@@ -100,6 +100,11 @@ def get_disk_info():
     parts = []
     for p in psutil.disk_partitions(all=False):
         try:
+            # Skip loop devices (snap), tmpfs, overlay — not real disks
+            if any(x in p.device for x in ["/dev/loop", "tmpfs", "overlay"]):
+                continue
+            if any(x in p.mountpoint for x in ["/snap/", "/run/snap", "/sys/", "/proc/"]):
+                continue
             u = psutil.disk_usage(p.mountpoint)
             parts.append({
                 "device": p.device,
