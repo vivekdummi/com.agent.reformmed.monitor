@@ -2,8 +2,6 @@
 # Run in PowerShell as Administrator:
 # irm https://raw.githubusercontent.com/vivekdummi/com.agent.reformmed.monitor/main/install-windows.ps1 | iex
 
-$ErrorActionPreference = "Stop"
-
 Write-Host ""
 Write-Host "╔══════════════════════════════════════════════╗" -ForegroundColor Cyan
 Write-Host "║     REFORMMED Monitor — Agent Setup          ║" -ForegroundColor Cyan
@@ -43,16 +41,21 @@ if ($confirm -ne "y" -and $confirm -ne "Y") {
 
 Write-Host ""
 Write-Host "[1/5] Setting up directory..." -ForegroundColor Blue
-if (Test-Path $d) { Remove-Item -Recurse -Force $d }
+if (Test-Path $d) { Remove-Item -Recurse -Force $d -ErrorAction SilentlyContinue }
 New-Item -ItemType Directory -Force -Path $d | Out-Null
 
 Write-Host "[2/5] Downloading agent..." -ForegroundColor Blue
-Invoke-WebRequest "https://raw.githubusercontent.com/vivekdummi/com.agent.reformmed.monitor/main/agent.py" `
-    -OutFile "$d\agent.py" -UseBasicParsing
+try {
+    Invoke-WebRequest "https://raw.githubusercontent.com/vivekdummi/com.agent.reformmed.monitor/main/agent.py" `
+        -OutFile "$d\agent.py" -UseBasicParsing
+} catch {
+    Write-Host "Failed to download agent. Check internet connection." -ForegroundColor Red
+    exit 1
+}
 
 Write-Host "[3/5] Installing Python dependencies..." -ForegroundColor Blue
 python -m venv "$d\venv" 2>&1 | Out-Null
-& "$d\venv\Scripts\pip.exe" install -q --upgrade pip 2>&1 | Out-Null
+# Skip pip upgrade - not critical
 & "$d\venv\Scripts\pip.exe" install -q psutil requests pynvml 2>&1 | Out-Null
 
 Write-Host "[4/5] Writing configuration..." -ForegroundColor Blue
@@ -76,7 +79,7 @@ subprocess.run([sys.executable, r"C:\reformmed-agent\agent.py"])
 '@
 
 Write-Host "[5/5] Registering scheduled task..." -ForegroundColor Blue
-Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false
+Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
 
 $action    = New-ScheduledTaskAction -Execute "$d\venv\Scripts\python.exe" -Argument "`"$d\launcher.py`"" -WorkingDirectory $d
 $trigger   = New-ScheduledTaskTrigger -AtStartup
@@ -103,7 +106,6 @@ Write-Host "    Stop    : Stop-ScheduledTask -TaskName '$taskName'"
 Write-Host "    Start   : Start-ScheduledTask -TaskName '$taskName'"
 Write-Host "    Status  : Get-ScheduledTask -TaskName '$taskName' | Select State"
 Write-Host "    Config  : notepad $d\.env"
-Write-Host "    Remove  : Get-ScheduledTask '$taskName' | Unregister-ScheduledTask -Confirm:`$false"
 Write-Host ""
 Write-Host "✅ Agent sending data to: $SERVER_URL" -ForegroundColor Cyan
 Write-Host "✅ Agent will auto-start on every Windows reboot!" -ForegroundColor Green
