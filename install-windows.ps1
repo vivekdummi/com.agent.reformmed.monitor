@@ -41,33 +41,30 @@ if ($confirm -ne "y" -and $confirm -ne "Y") {
 
 Write-Host ""
 Write-Host "[1/5] Setting up directory..." -ForegroundColor Blue
-if (Test-Path $d) { Remove-Item -Recurse -Force $d -ErrorAction SilentlyContinue }
+if (Test-Path $d) { 
+    Remove-Item -Recurse -Force $d -ErrorAction SilentlyContinue | Out-Null
+}
 New-Item -ItemType Directory -Force -Path $d | Out-Null
 
 Write-Host "[2/5] Downloading agent..." -ForegroundColor Blue
-try {
-    Invoke-WebRequest "https://raw.githubusercontent.com/vivekdummi/com.agent.reformmed.monitor/main/agent.py" `
-        -OutFile "$d\agent.py" -UseBasicParsing
-} catch {
-    Write-Host "Failed to download agent. Check internet connection." -ForegroundColor Red
-    exit 1
-}
+Invoke-WebRequest "https://raw.githubusercontent.com/vivekdummi/com.agent.reformmed.monitor/main/agent.py" `
+    -OutFile "$d\agent.py" -UseBasicParsing | Out-Null
 
 Write-Host "[3/5] Installing Python dependencies..." -ForegroundColor Blue
-python -m venv "$d\venv" 2>&1 | Out-Null
-# Skip pip upgrade - not critical
-& "$d\venv\Scripts\pip.exe" install -q psutil requests pynvml 2>&1 | Out-Null
+python -m venv "$d\venv" *>&1 | Out-Null
+Start-Sleep -Milliseconds 500
+& "$d\venv\Scripts\pip.exe" install psutil requests pynvml *>&1 | Out-Null
 
 Write-Host "[4/5] Writing configuration..." -ForegroundColor Blue
-Set-Content "$d\.env" @"
+@"
 REFORMMED_SERVER_URL=$SERVER_URL
 REFORMMED_API_KEY=$API_KEY
 REFORMMED_SYSTEM_NAME=$SYSTEM_NAME
 REFORMMED_LOCATION=$LOCATION
 REFORMMED_INTERVAL=$INTERVAL
-"@
+"@ | Out-File -FilePath "$d\.env" -Encoding ASCII
 
-Set-Content "$d\launcher.py" @'
+@'
 import os, subprocess, sys
 with open(r"C:\reformmed-agent\.env") as f:
     for line in f:
@@ -76,10 +73,13 @@ with open(r"C:\reformmed-agent\.env") as f:
             key, val = line.split("=", 1)
             os.environ[key.strip()] = val.strip()
 subprocess.run([sys.executable, r"C:\reformmed-agent\agent.py"])
-'@
+'@ | Out-File -FilePath "$d\launcher.py" -Encoding ASCII
 
 Write-Host "[5/5] Registering scheduled task..." -ForegroundColor Blue
-Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
+$existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+if ($existing) { 
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false | Out-Null
+}
 
 $action    = New-ScheduledTaskAction -Execute "$d\venv\Scripts\python.exe" -Argument "`"$d\launcher.py`"" -WorkingDirectory $d
 $trigger   = New-ScheduledTaskTrigger -AtStartup
@@ -87,7 +87,7 @@ $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGo
 $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
-Start-ScheduledTask -TaskName $taskName
+Start-ScheduledTask -TaskName $taskName | Out-Null
 Start-Sleep -Seconds 3
 
 $state = (Get-ScheduledTask -TaskName $taskName).State
