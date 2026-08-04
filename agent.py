@@ -14,7 +14,7 @@ API_URL = os.getenv("REFORMMED_API_URL", "http://localhost:8000")
 API_KEY = os.getenv("REFORMMED_API_SECRET", "")
 SYSTEM_NAME = os.getenv("REFORMMED_SYSTEM_NAME", "unknown")
 LOCATION = os.getenv("REFORMMED_LOCATION", "unknown")
-INTERVAL = int(os.getenv("REFORMMED_INTERVAL", "1"))
+INTERVAL = int(os.getenv("REFORMMED_INTERVAL", "15"))
 
 # GPU detection
 GPU_TYPE = None
@@ -47,11 +47,25 @@ log.info(f"  Server   : {API_URL}")
 log.info(f"  GPU      : {GPU_TYPE or 'None'}")
 log.info("=======================================================")
 
+# Public IP is cached — refreshed every N seconds instead of on every single send
+_public_ip_cache = {"ip": "unknown", "ts": 0}
+PUBLIC_IP_REFRESH_SECS = 600
+
+# Process objects persist across loop iterations so psutil.cpu_percent() has a
+# real baseline to diff against (a fresh Process object always reports 0.0 on
+# its first call).
+_proc_cache = {}
+
 def get_public_ip():
-    try:
-        return requests.get("https://api.ipify.org", timeout=3).text
-    except:
-        return "unknown"
+    """Cached — refreshed at most once every PUBLIC_IP_REFRESH_SECS, not on every send."""
+    now = time.time()
+    if now - _public_ip_cache["ts"] > PUBLIC_IP_REFRESH_SECS or _public_ip_cache["ip"] == "unknown":
+        try:
+            _public_ip_cache["ip"] = requests.get("https://api.ipify.org", timeout=3).text
+            _public_ip_cache["ts"] = now
+        except Exception:
+            pass  # keep last known value on failure
+    return _public_ip_cache["ip"]
 
 def get_intel_gpu_stats():
     """Get Intel GPU stats using intel_gpu_top"""
@@ -176,6 +190,48 @@ def get_gpu_info():
     
     return gpus
 
+def get_top_processes(limit=20):
+    """
+    psutil's per-process cpu_percent() needs a prior call on the SAME Process
+    object to compute a delta — a freshly created Process always returns 0.0
+    on its first call. We keep Process objects alive across loop iterations
+    (module-level _proc_cache) so cpu_percent() has a real baseline each time.
+    """
+    procs = []
+    seen_pids = set()
+
+    for p in psutil.process_iter(['pid']):
+        pid = p.pid
+        seen_pids.add(pid)
+        cached = _proc_cache.get(pid)
+        if cached is None:
+            try:
+                cached = psutil.Process(pid)
+                cached.cpu_percent(interval=None)  # prime baseline; discard the 0.0
+                _proc_cache[pid] = cached
+                continue  # no meaningful delta yet on a brand-new process this cycle
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+        try:
+            procs.append({
+                "pid": pid,
+                "name": cached.name(),
+                "cpu_percent": round(cached.cpu_percent(interval=None), 2),
+                "mem_percent": round(cached.memory_percent(), 2),
+                "status": cached.status(),
+            })
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            _proc_cache.pop(pid, None)
+
+    # Drop cached entries for processes that have exited
+    for pid in list(_proc_cache.keys()):
+        if pid not in seen_pids:
+            _proc_cache.pop(pid, None)
+
+    procs.sort(key=lambda x: x["cpu_percent"], reverse=True)
+    return procs[:limit]
+
+
 def collect_metrics():
     cpu_temp = None
     try:
@@ -185,6 +241,27 @@ def collect_metrics():
     except:
         pass
     
+    disk_partitions = []
+    for p in psutil.disk_partitions():
+        if not p.fstype:
+            continue
+        try:
+            du = psutil.disk_usage(p.mountpoint)
+        except (PermissionError, OSError):
+            continue
+        disk_partitions.append({
+            "device": p.device,
+            "mountpoint": p.mountpoint,
+            "fstype": p.fstype,
+            "total_gb": round(du.total / 1024**3, 2),
+            "used_gb": round(du.used / 1024**3, 2),
+            "free_gb": round(du.free / 1024**3, 2),
+            "percent": du.percent
+        })
+
+    dio = psutil.disk_io_counters()
+    nio = psutil.net_io_counters()
+
     return {
         "cpu_percent": psutil.cpu_percent(interval=0.1),
         "cpu_per_core": psutil.cpu_percent(interval=0.1, percpu=True),
@@ -197,39 +274,18 @@ def collect_metrics():
         "swap_used_gb": round(psutil.swap_memory().used / 1024**3, 2),
         "swap_percent": psutil.swap_memory().percent,
         "gpu_info": get_gpu_info(),
-        "disk_partitions": [
-            {
-                "device": p.device,
-                "mountpoint": p.mountpoint,
-                "fstype": p.fstype,
-                "total_gb": round(psutil.disk_usage(p.mountpoint).total / 1024**3, 2),
-                "used_gb": round(psutil.disk_usage(p.mountpoint).used / 1024**3, 2),
-                "free_gb": round(psutil.disk_usage(p.mountpoint).free / 1024**3, 2),
-                "percent": psutil.disk_usage(p.mountpoint).percent
-            }
-            for p in psutil.disk_partitions() if p.fstype
-        ],
+        "disk_partitions": disk_partitions,
         "disk_io": {
-            "read_mb": round(psutil.disk_io_counters().read_bytes / 1024**2, 2),
-            "write_mb": round(psutil.disk_io_counters().write_bytes / 1024**2, 2),
-            "read_count": psutil.disk_io_counters().read_count,
-            "write_count": psutil.disk_io_counters().write_count
+            "read_mb": round(dio.read_bytes / 1024**2, 2) if dio else 0,
+            "write_mb": round(dio.write_bytes / 1024**2, 2) if dio else 0,
+            "read_count": dio.read_count if dio else 0,
+            "write_count": dio.write_count if dio else 0
         },
-        "net_bytes_sent": psutil.net_io_counters().bytes_sent,
-        "net_bytes_recv": psutil.net_io_counters().bytes_recv,
-        "net_packets_sent": psutil.net_io_counters().packets_sent,
-        "net_packets_recv": psutil.net_io_counters().packets_recv,
-        "top_processes": [
-            {
-                "pid": p.pid,
-                "name": p.name(),
-                "cpu_percent": p.cpu_percent(),
-                "mem_percent": round(p.memory_percent(), 2),
-                "status": p.status()
-            }
-            for p in sorted(psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent', 'status']),
-                          key=lambda x: x.cpu_percent(), reverse=True)[:20]
-        ],
+        "net_bytes_sent": nio.bytes_sent,
+        "net_bytes_recv": nio.bytes_recv,
+        "net_packets_sent": nio.packets_sent,
+        "net_packets_recv": nio.packets_recv,
+        "top_processes": get_top_processes(20),
         "uptime_seconds": round(time.time() - psutil.boot_time(), 2),
         "boot_time": datetime.fromtimestamp(psutil.boot_time(), timezone.utc).isoformat(),
         "public_ip": get_public_ip(),
