@@ -1,130 +1,120 @@
-#!/bin/bash
-set -e
+# REFORMMED Monitor — Windows Agent Installer
+# Run in PowerShell as Administrator:
+# irm https://raw.githubusercontent.com/vivekdummi/com.agent.reformmed.monitor/main/install-windows.ps1 | iex
 
-echo "╔══════════════════════════════════════════════╗"
-echo "║     REFORMMED Monitor — Agent Setup          ║"
-echo "╚══════════════════════════════════════════════╝"
+Write-Host ""
+Write-Host "╔══════════════════════════════════════════════╗" -ForegroundColor Cyan
+Write-Host "║     REFORMMED Monitor — Agent Setup          ║" -ForegroundColor Cyan
+Write-Host "╚══════════════════════════════════════════════╝" -ForegroundColor Cyan
+Write-Host ""
 
-# Collect inputs
-echo "Enter the following details:"
-read -p "VM Server IP (e.g. 164.52.221.241): " SERVER_IP
-read -p "VM Server port [8000]: " SERVER_PORT
-SERVER_PORT=${SERVER_PORT:-8000}
-read -p "API Secret Key: " API_SECRET
-read -p "Machine name (e.g. Salem-Hospital-PC1): " SYSTEM_NAME
-read -p "Location (e.g. Salem): " LOCATION
-read -p "Send interval in seconds [15]: " INTERVAL
-INTERVAL=${INTERVAL:-15}
+Write-Host "Enter the following details:" -ForegroundColor Yellow
+Write-Host ""
 
-echo "─────────────────────────────────────────────"
-echo "  Server URL  : http://$SERVER_IP:$SERVER_PORT"
-echo "  System Name : $SYSTEM_NAME"
-echo "  Location    : $LOCATION"
-echo "  Interval    : ${INTERVAL}s"
-echo "─────────────────────────────────────────────"
-read -p "Confirm and install? [y/N]: " CONFIRM
+$VM_IP       = Read-Host "VM Server IP (e.g. 164.52.221.241)"
+$VM_PORT     = Read-Host "VM Server port [8000]"
+if (-not $VM_PORT) { $VM_PORT = "8000" }
+$API_KEY     = Read-Host "API Secret Key"
+$SYSTEM_NAME = Read-Host "Machine name (e.g. Office-PC1)"
+$LOCATION    = Read-Host "Location (e.g. Salem)"
+$INTERVAL    = Read-Host "Send interval in seconds [15]"
+if (-not $INTERVAL) { $INTERVAL = "15" }
 
-if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
-    echo "Installation cancelled."
-    exit 0
-fi
+$SERVER_URL  = "http://${VM_IP}:${VM_PORT}"
+$d           = "C:\reformmed-agent"
+$taskName    = "ReformmedMonitorAgent"
 
-# Fix apt_pkg error first
-echo "[0/7] Fixing apt_pkg error..."
-sudo apt --fix-broken install -y 2>/dev/null || true
-
-echo "[1/7] Installing system dependencies..."
-sudo apt update -qq 2>/dev/null || true
-sudo apt install -y python3 python3-pip python3-venv curl || {
-    echo "⚠️  Warning: Some packages may have failed, continuing..."
+Write-Host ""
+Write-Host "─────────────────────────────────────────────" -ForegroundColor Blue
+Write-Host "  Server URL  : $SERVER_URL" -ForegroundColor White
+Write-Host "  API Key     : $($API_KEY.Substring(0,20))..." -ForegroundColor White
+Write-Host "  System Name : $SYSTEM_NAME" -ForegroundColor White
+Write-Host "  Location    : $LOCATION" -ForegroundColor White
+Write-Host "  Interval    : ${INTERVAL}s" -ForegroundColor White
+Write-Host "─────────────────────────────────────────────" -ForegroundColor Blue
+Write-Host ""
+$confirm = Read-Host "Confirm and install? [y/N]"
+if ($confirm -ne "y" -and $confirm -ne "Y") { 
+    Write-Host "Cancelled." -ForegroundColor Yellow
+    exit 0 
 }
 
-echo "[2/7] Creating dedicated service account..."
-if ! id -u reformmed &>/dev/null; then
-    sudo useradd --system --no-create-home --shell /usr/sbin/nologin reformmed
-fi
-# Group membership for GPU/sensor device access (harmless if groups don't exist)
-sudo usermod -aG video,render reformmed 2>/dev/null || true
+Write-Host ""
+Write-Host "[1/5] Setting up directory..." -ForegroundColor Blue
+if (Test-Path $d) { 
+    Remove-Item -Recurse -Force $d -ErrorAction SilentlyContinue | Out-Null
+}
+New-Item -ItemType Directory -Force -Path $d | Out-Null
 
-echo "[3/7] Creating agent directory..."
-sudo mkdir -p /opt/reformmed-agent
-sudo chown -R reformmed:reformmed /opt/reformmed-agent
-cd /opt/reformmed-agent
+Write-Host "[2/5] Downloading agent..." -ForegroundColor Blue
+Invoke-WebRequest "https://raw.githubusercontent.com/vivekdummi/com.agent.reformmed.monitor/main/agent.py" `
+    -OutFile "$d\agent.py" -UseBasicParsing | Out-Null
 
-echo "[4/7] Downloading agent code..."
-sudo -u reformmed curl -sSL https://raw.githubusercontent.com/vivekdummi/com.agent.reformmed.monitor/main/agent.py -o agent.py
+Write-Host "[3/5] Installing Python dependencies..." -ForegroundColor Blue
+python -m venv "$d\venv" *>&1 | Out-Null
+Start-Sleep -Milliseconds 500
+# python-dotenv is required — agent.py imports it on line 1. Missing it here
+# caused ModuleNotFoundError on every start regardless of the launcher.py
+# env-injection trick below, since the import itself fails before that runs.
+& "$d\venv\Scripts\pip.exe" install psutil requests pynvml python-dotenv *>&1 | Out-Null
 
-echo "[5/7] Setting up Python environment..."
-sudo -u reformmed python3 -m venv venv
-sudo -u reformmed ./venv/bin/pip install --quiet --upgrade pip
-# NOTE: python-dotenv is required — agent.py imports it on line 1.
-# Missing it here was the bug that caused ModuleNotFoundError on every
-# fresh install and required a manual "pip install python-dotenv" patch.
-sudo -u reformmed ./venv/bin/pip install --quiet psutil requests pynvml python-dotenv
-
-# Detect GPU
-GPU_TYPE="none"
-if command -v nvidia-smi &> /dev/null; then
-    GPU_TYPE="nvidia"
-elif command -v intel_gpu_top &> /dev/null; then
-    GPU_TYPE="intel"
-fi
-
-echo "[6/7] Creating configuration..."
-sudo -u reformmed tee .env > /dev/null <<EOF
-REFORMMED_API_URL=http://$SERVER_IP:$SERVER_PORT
-REFORMMED_API_SECRET=$API_SECRET
+Write-Host "[4/5] Writing configuration..." -ForegroundColor Blue
+@"
+REFORMMED_API_URL=$SERVER_URL
+REFORMMED_API_SECRET=$API_KEY
 REFORMMED_SYSTEM_NAME=$SYSTEM_NAME
 REFORMMED_LOCATION=$LOCATION
 REFORMMED_INTERVAL=$INTERVAL
-GPU_TYPE=$GPU_TYPE
-EOF
-sudo chmod 600 .env
-sudo chown reformmed:reformmed .env
+"@ | Out-File -FilePath "$d\.env" -Encoding ASCII
 
-echo "[7/7] Setting up systemd service..."
-sudo tee /etc/systemd/system/reformmed-agent.service > /dev/null <<'SERVICEEOF'
-[Unit]
-Description=REFORMMED Monitor Agent
-After=network-online.target
-Wants=network-online.target
+@'
+import os, subprocess, sys
+with open(r"C:\reformmed-agent\.env") as f:
+    for line in f:
+        line = line.strip()
+        if line and "=" in line and not line.startswith("#"):
+            key, val = line.split("=", 1)
+            os.environ[key.strip()] = val.strip()
+subprocess.run([sys.executable, r"C:\reformmed-agent\agent.py"])
+'@ | Out-File -FilePath "$d\launcher.py" -Encoding ASCII
 
-[Service]
-Type=simple
-User=reformmed
-Group=reformmed
-WorkingDirectory=/opt/reformmed-agent
-ExecStart=/opt/reformmed-agent/venv/bin/python /opt/reformmed-agent/agent.py
-Restart=always
-RestartSec=10
-Environment="PYTHONUNBUFFERED=1"
+Write-Host "[5/5] Registering scheduled task..." -ForegroundColor Blue
+$existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+if ($existing) { 
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false | Out-Null
+}
 
-[Install]
-WantedBy=multi-user.target
-SERVICEEOF
+$action    = New-ScheduledTaskAction -Execute "$d\venv\Scripts\python.exe" -Argument "`"$d\launcher.py`"" -WorkingDirectory $d
+$trigger   = New-ScheduledTaskTrigger -AtStartup
+$settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Days 3650)
+$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 
-sudo systemctl daemon-reload
-sudo systemctl enable reformmed-agent
-sudo systemctl restart reformmed-agent
+Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
+Start-ScheduledTask -TaskName $taskName | Out-Null
+Start-Sleep -Seconds 3
 
-sleep 3
+$state = (Get-ScheduledTask -TaskName $taskName).State
 
-echo ""
-echo "╔══════════════════════════════════════════════╗"
-echo "║        ✅ Installation Complete!             ║"
-echo "╚══════════════════════════════════════════════╝"
-echo ""
-echo "📊 Agent Status:"
-sudo systemctl status reformmed-agent --no-pager -l | head -10
-echo ""
-echo "📋 Check logs:"
-echo "   sudo journalctl -u reformmed-agent -f"
-echo ""
-echo "🌐 Dashboard:"
-echo "   http://$SERVER_IP:5000"
-echo ""
-echo "🔧 Control commands:"
-echo "   sudo systemctl start reformmed-agent"
-echo "   sudo systemctl stop reformmed-agent"
-echo "   sudo systemctl restart reformmed-agent"
-echo ""
+Write-Host ""
+Write-Host "╔══════════════════════════════════════════════╗" -ForegroundColor Green
+Write-Host "║        ✅ Installation Complete!             ║" -ForegroundColor Green
+Write-Host "╚══════════════════════════════════════════════╝" -ForegroundColor Green
+Write-Host ""
+Write-Host "  Task status : $state" -ForegroundColor Cyan
+Write-Host "  Install dir : $d" -ForegroundColor Cyan
+Write-Host "  Config file : $d\.env" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "  Manage agent:" -ForegroundColor Yellow
+Write-Host "    Stop    : Stop-ScheduledTask -TaskName '$taskName'"
+Write-Host "    Start   : Start-ScheduledTask -TaskName '$taskName'"
+Write-Host "    Status  : Get-ScheduledTask -TaskName '$taskName' | Select State"
+Write-Host "    Config  : notepad $d\.env"
+Write-Host ""
+Write-Host "✅ Agent sending data to: $SERVER_URL" -ForegroundColor Cyan
+Write-Host "✅ Agent will auto-start on every Windows reboot!" -ForegroundColor Green
+Write-Host ""
+Write-Host "ℹ️  Note: CPU temperature and Intel GPU detail stats are Linux-only" -ForegroundColor DarkGray
+Write-Host "   features (psutil/intel_gpu_top don't support Windows) — those" -ForegroundColor DarkGray
+Write-Host "   fields will show as empty/0 here. CPU/RAM/disk/NVIDIA GPU (via" -ForegroundColor DarkGray
+Write-Host "   pynvml) all work normally." -ForegroundColor DarkGray
+Write-Host ""
