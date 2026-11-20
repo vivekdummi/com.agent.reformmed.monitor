@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os, sys, time, psutil, requests, json, platform, socket, logging, subprocess
+import pwd, re, shutil
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
@@ -39,12 +40,189 @@ try:
 except:
     pass
 
+# ── PM2 detection ──────────────────────────────────────────────────────────
+# A machine can run several PM2 daemons — one per user who started PM2
+# (e.g. root's /root/.pm2 AND adminqa's /home/adminqa/.pm2). `pm2 jlist`
+# only talks to the daemon of whoever runs it, so we find every running
+# daemon and query each one as its own user. Run the agent as root to see
+# every user's daemon; as a normal user it only sees its own.
+#
+# Daemons are found two ways, since the "PM2 vX: God Daemon (<home>)"
+# process title can be truncated or missing (short argv, old PM2):
+#   1. <home>/pm2.pid files under /root and /home/* whose pid is alive
+#   2. any process whose command line mentions "God Daemon"
+# Only daemons that are already running are queried, so the agent never
+# spawns a new (empty) PM2 daemon the way a bare `pm2 jlist` does.
+_PM2_DAEMON_RE = re.compile(r"God Daemon \((.+?)\)")
+_PM2_DAEMON_CACHE_SECS = 60
+# `pm2 jlist` starts a node process per daemon — don't do that on every send
+# when REFORMMED_INTERVAL is short; reuse the last list for this long.
+PM2_REFRESH_SECS = int(os.getenv("REFORMMED_PM2_REFRESH_SECS", "10"))
+_pm2_daemon_cache = {"ts": 0.0, "daemons": []}
+_pm2_result_cache = {"ts": 0.0, "procs": []}
+_pm2_warned = set()
+_AGENT_USER = pwd.getpwuid(os.geteuid()).pw_name
+_IS_ROOT = os.geteuid() == 0
+
+
+def _user_of_uid(uid):
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return None
+
+
+def _daemon_info(proc, home, user=None):
+    try:
+        node_dir = os.path.dirname(proc.exe())
+    except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+        node_dir = None
+    if not user:
+        try:
+            user = proc.username()
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            user = None
+    return {"user": user or _AGENT_USER, "home": os.path.realpath(home),
+            "node_dir": node_dir, "pid": proc.pid}
+
+
+def _find_pm2_daemons(force=False):
+    """[{user, home, node_dir, pid}] for every running PM2 daemon (cached 60s)."""
+    now = time.time()
+    if not force and now - _pm2_daemon_cache["ts"] < _PM2_DAEMON_CACHE_SECS:
+        return _pm2_daemon_cache["daemons"]
+    found = {}
+
+    # 1. pid files — works whatever the daemon's process title looks like.
+    homes = ["/root/.pm2"]
+    try:
+        homes += [os.path.join("/home", d, ".pm2") for d in os.listdir("/home")]
+    except OSError:
+        pass
+    for home in homes:
+        pid_file = os.path.join(home, "pm2.pid")
+        try:
+            with open(pid_file) as f:
+                pid = int(f.read().strip())
+            proc = psutil.Process(pid)
+            if proc.status() == psutil.STATUS_ZOMBIE:
+                continue
+            info = _daemon_info(proc, home, _user_of_uid(os.stat(pid_file).st_uid))
+            found.setdefault(info["home"], info)
+        except (OSError, ValueError, psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    # 2. process titles — catches a PM2_HOME outside /root and /home.
+    known_pids = {d["pid"] for d in found.values()}
+    for p in psutil.process_iter(['pid', 'name', 'cmdline']):
+        try:
+            if p.pid in known_pids:
+                continue
+            cmd = " ".join(p.info['cmdline'] or []) or (p.info['name'] or "")
+            if "God Daemon" not in cmd:
+                continue
+            m = _PM2_DAEMON_RE.search(cmd)
+            home = m.group(1) if m else None
+            if not home:
+                try:
+                    home = p.environ().get("PM2_HOME")
+                except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+                    home = None
+            if not home:
+                try:
+                    home = os.path.join(pwd.getpwnam(p.username()).pw_dir, ".pm2")
+                except (KeyError, psutil.AccessDenied, psutil.NoSuchProcess):
+                    continue
+            info = _daemon_info(p, home)
+            found.setdefault(info["home"], info)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+
+    _pm2_daemon_cache.update(ts=now, daemons=list(found.values()))
+    return _pm2_daemon_cache["daemons"]
+
+
+def _pm2_binary(node_dir):
+    """The pm2 CLI that belongs to the daemon's node install, else whatever is on PATH."""
+    candidates = []
+    if node_dir:
+        candidates.append(os.path.join(node_dir, "pm2"))
+    candidates += [shutil.which("pm2"), "/usr/local/bin/pm2", "/usr/bin/pm2"]
+    for c in candidates:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def _pm2_jlist(daemon):
+    """Raw `pm2 jlist` list for one daemon, run as that daemon's user."""
+    user, home, node_dir = daemon["user"], daemon["home"], daemon["node_dir"]
+    pm2 = _pm2_binary(node_dir)
+    if not pm2:
+        if home not in _pm2_warned:
+            _pm2_warned.add(home)
+            log.warning(f"PM2 daemon for {user} ({home}) found but no pm2 CLI to query it")
+        return []
+
+    # pm2 is a `#!/usr/bin/env node` script — node must be on PATH.
+    path = os.pathsep.join(x for x in (node_dir, os.path.dirname(pm2),
+                                       os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")) if x)
+    try:
+        pw = pwd.getpwnam(user)
+    except KeyError:
+        pw = None
+    env = dict(os.environ, PM2_HOME=home, PATH=path,
+               HOME=pw.pw_dir if pw else os.path.dirname(home))
+
+    kwargs = {}
+    if user != _AGENT_USER:
+        if not (_IS_ROOT and pw):
+            if home not in _pm2_warned:
+                _pm2_warned.add(home)
+                log.warning(f"PM2 daemon for {user} ({home}) is running but this agent runs as "
+                            f"{_AGENT_USER} — run the agent as root to report it")
+            return []
+        # Drop to the owner directly (no runuser, so no PAM session lines in
+        # the journal on every send) — nothing in their ~/.pm2 ends up root-owned.
+        env["USER"] = env["LOGNAME"] = user
+        kwargs = {"user": pw.pw_uid, "group": pw.pw_gid, "extra_groups": []}
+
+    try:
+        result = subprocess.run([pm2, "jlist"], capture_output=True, text=True,
+                                timeout=10, env=env, **kwargs)
+    except Exception as e:
+        log.debug(f"pm2 jlist failed for {user}: {e}")
+        return []
+    out = result.stdout or ""
+    # pm2 sometimes prints notices (e.g. "In-memory PM2 is out-of-date") before the JSON.
+    start = out.find("[")
+    if result.returncode != 0 or start == -1:
+        if home not in _pm2_warned:
+            _pm2_warned.add(home)
+            log.warning(f"pm2 jlist for {user} ({home}) failed, exit {result.returncode}: "
+                        f"{(result.stderr or out).strip()[:300]}")
+        return []
+    try:
+        data = json.loads(out[start:])
+        return data if isinstance(data, list) else []
+    except ValueError:
+        log.debug(f"pm2 jlist for {user}: unparseable output")
+        return []
+
+
+_startup_daemons = _find_pm2_daemons(force=True)
+HAS_PM2 = bool(_startup_daemons) or shutil.which("pm2") is not None
+if _startup_daemons:
+    log.info("✅ PM2 daemons: " + ", ".join(f"{d['user']} ({d['home']})" for d in _startup_daemons))
+
 log.info("=======================================================")
 log.info("  REFORMMED Monitor Agent")
 log.info(f"  System   : {SYSTEM_NAME}")
 log.info(f"  Location : {LOCATION}")
 log.info(f"  Server   : {API_URL}")
 log.info(f"  GPU      : {GPU_TYPE or 'None'}")
+log.info(f"  PM2      : {', '.join(d['user'] for d in _startup_daemons) or ('installed, no daemon running' if HAS_PM2 else 'No')}")
+log.info(f"  Run as   : {_AGENT_USER}")
 log.info("=======================================================")
 
 # Public IP is cached — refreshed every N seconds instead of on every single send
@@ -67,6 +245,47 @@ def get_public_ip():
             pass  # keep last known value on failure
     return _public_ip_cache["ip"]
 
+def get_pm2_processes():
+    """
+    Every process managed by every PM2 daemon on this machine — e.g. the
+    camera analytics workers — so a dead worker shows up in the dashboard
+    the same way an offline machine does. Each entry carries pm2_user (the
+    daemon it belongs to), since ids repeat across daemons.
+    Uses `pm2 jlist` (JSON) rather than parsing the `pm2 list` table.
+    """
+    now = time.time()
+    if now - _pm2_result_cache["ts"] < PM2_REFRESH_SECS:
+        return _pm2_result_cache["procs"]
+    out = []
+    for daemon in _find_pm2_daemons():
+        try:
+            procs = _pm2_jlist(daemon)
+        except Exception as e:
+            log.debug(f"PM2 process list error for {daemon['user']}: {e}")
+            continue
+        for p in procs:
+            env = p.get("pm2_env", {}) or {}
+            monit = p.get("monit", {}) or {}
+            pm_uptime_ms = env.get("pm_uptime")
+            uptime_secs = None
+            if pm_uptime_ms and env.get("status") == "online":
+                uptime_secs = round((time.time() * 1000 - pm_uptime_ms) / 1000, 1)
+            out.append({
+                "name":         p.get("name"),
+                "pm_id":        p.get("pm_id"),
+                "pid":          p.get("pid"),
+                "pm2_user":     daemon["user"],
+                "status":       env.get("status"),           # online / stopped / errored / ...
+                "restarts":     env.get("restart_time", 0),
+                "cpu_percent":  monit.get("cpu", 0),
+                "mem_mb":       round((monit.get("memory") or 0) / 1024**2, 1),
+                "uptime_secs":  uptime_secs,
+                "exec_mode":    env.get("exec_mode"),
+                "instances":    env.get("instances"),
+            })
+    _pm2_result_cache.update(ts=now, procs=out)
+    return out
+
 def get_intel_gpu_stats():
     """Get Intel GPU stats using intel_gpu_top"""
     try:
@@ -76,16 +295,16 @@ def get_intel_gpu_stats():
             text=True,
             timeout=3
         )
-        
+
         # timeout command returns 124 when it kills the process after 2 seconds
         if result.returncode in [0, 124] and result.stdout:
             output = result.stdout.strip()
-            
+
             # Find the last complete JSON object
             last_brace = output.rfind('}')
             if last_brace == -1:
                 return None
-            
+
             # Find matching opening brace
             brace_count = 0
             start_pos = last_brace
@@ -97,17 +316,17 @@ def get_intel_gpu_stats():
                     if brace_count == 0:
                         start_pos = i
                         break
-            
+
             last_json = output[start_pos:last_brace+1]
             sample = json.loads(last_json)
-            
+
             engines = sample.get('engines', {})
             total_usage = sum([
                 engines.get('Render/3D', {}).get('busy', 0),
                 engines.get('Compute', {}).get('busy', 0),
                 engines.get('Video', {}).get('busy', 0)
             ])
-            
+
             return {
                 'freq_actual': round(sample.get('frequency', {}).get('actual', 0), 2),
                 'freq_requested': round(sample.get('frequency', {}).get('requested', 0), 2),
@@ -121,12 +340,12 @@ def get_intel_gpu_stats():
             }
     except Exception as e:
         log.debug(f"Intel GPU stats error: {e}")
-    
+
     return None
 
 def get_gpu_info():
     gpus = []
-    
+
     # NVIDIA GPUs
     if HAS_NVIDIA:
         try:
@@ -145,16 +364,16 @@ def get_gpu_info():
                 })
         except Exception as e:
             log.debug(f"NVIDIA GPU error: {e}")
-    
+
     # Intel GPU
     if HAS_INTEL:
         try:
             result = os.popen("lspci | grep -i vga | grep -i intel").read().strip()
             gpu_name = result.split(": ")[1] if ": " in result else result
-            
+
             # Get Intel GPU stats
             intel_stats = get_intel_gpu_stats()
-            
+
             if intel_stats:
                 gpus.append({
                     "name": gpu_name,
@@ -187,7 +406,7 @@ def get_gpu_info():
                 })
         except Exception as e:
             log.debug(f"Intel GPU error: {e}")
-    
+
     return gpus
 
 def get_top_processes(limit=20):
@@ -240,7 +459,7 @@ def collect_metrics():
             cpu_temp = max([t.current for t in temps["coretemp"]])
     except:
         pass
-    
+
     disk_partitions = []
     for p in psutil.disk_partitions():
         if not p.fstype:
@@ -286,6 +505,7 @@ def collect_metrics():
         "net_packets_sent": nio.packets_sent,
         "net_packets_recv": nio.packets_recv,
         "top_processes": get_top_processes(20),
+        "pm2_processes": get_pm2_processes(),
         "uptime_seconds": round(time.time() - psutil.boot_time(), 2),
         "boot_time": datetime.fromtimestamp(psutil.boot_time(), timezone.utc).isoformat(),
         "public_ip": get_public_ip(),
@@ -322,29 +542,34 @@ def register():
 def main():
     table_name = register()
     count = 0
-    
+
     while True:
         try:
             data = collect_metrics()
             data["table_name"] = table_name
-            
+
             resp = requests.post(
                 f"{API_URL}/metrics",
                 json=data,
                 headers={"X-API-Key": API_KEY},
                 timeout=5
             )
-            
+
             if resp.status_code == 200:
                 count += 1
                 gpu_count = len(data['gpu_info'])
                 gpu_usage = data['gpu_info'][0]['gpu_percent'] if gpu_count > 0 else 0
-                log.info(f"📊 {count} sent | CPU: {data['cpu_percent']}% | RAM: {data['ram_percent']}% | GPU: {gpu_usage}% ({gpu_count}) | Temp: {data['cpu_temp']}°C")
+                pm2_count = len(data['pm2_processes'])
+                pm2_down  = sum(1 for p in data['pm2_processes'] if p['status'] != 'online')
+                pm2_users = sorted({p['pm2_user'] for p in data['pm2_processes']})
+                pm2_txt   = (f" | PM2: {pm2_count}({pm2_down} down) [{', '.join(pm2_users)}]"
+                             if pm2_count else "")
+                log.info(f"📊 {count} sent | CPU: {data['cpu_percent']}% | RAM: {data['ram_percent']}% | GPU: {gpu_usage}% ({gpu_count}) | Temp: {data['cpu_temp']}°C{pm2_txt}")
             else:
                 log.error(f"Send failed: {resp.status_code}")
         except Exception as e:
             log.error(f"Send error: {e}")
-        
+
         time.sleep(INTERVAL)
 
 if __name__ == "__main__":
